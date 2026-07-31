@@ -1,10 +1,13 @@
 
 // ITK includes
 #include <itkImageDuplicator.h>
-#include <itkCastImageFilter.h>
 
 // DCMQI includes
 #include "dcmqi/ParaMapConverter.h"
+#include "dcmqi/SourceImageIndex.h"
+
+// STD includes
+#include <memory>
 
 // DCMTK includes
 #include <dcmtk/config/osconfig.h>
@@ -251,110 +254,50 @@ namespace dcmqi {
     CHECK_COND(pMapDoc->addForAllFrames(rwvmFG));
 
     /* Map referenced instances to the ITK parametric map slices */
-    // this is a hack - the function below needs to be factored out
-    vector<vector<int> > slice2derimg;
-    bool hasDerivationImages = false;
+    // Inventory of the source images, used to map slices of the parametric map
+    // to the source frames and to create the references derived from that mapping
+    SourceImageIndex sourceIndex(dcmDatasets);
+    vector<vector<size_t> > slice2frames = sourceIndex.mapSlicesToFrames(*parametricMapImage);
     {
-
-      typedef itk::CastImageFilter<FloatImageType,ShortImageType> CastFilterType;
-      CastFilterType::Pointer cast = CastFilterType::New();
-      cast->SetInput(parametricMapImage);
-      cast->Update();
-      slice2derimg = getSliceMapForSegmentation2DerivationImage(dcmDatasets, cast->GetOutput());
       cout << "Mapping from the ITK image slices to the DICOM instances in the input list" << endl;
-      for(size_t i=0;i<slice2derimg.size();i++){
+      for(size_t i=0;i<slice2frames.size();i++){
         cout << "  Slice " << i << ": ";
-        for(size_t j=0;j<slice2derimg[i].size();j++){
-          cout << slice2derimg[i][j] << " ";
-          hasDerivationImages = true;
+        for(size_t j=0;j<slice2frames[i].size();j++){
+          cout << slice2frames[i][j] << " ";
         }
         cout << endl;
       }
     }
 
-    // TODO: factor initialization of the referenced instances out into Common class
-    IODCommonInstanceReferenceModule &commref = pMapDoc->getCommonInstanceReference();
-    OFVector<IODSeriesAndInstanceReferenceMacro::ReferencedSeriesItem*> &refseries = commref.getReferencedSeriesItems();
-
-    IODSeriesAndInstanceReferenceMacro::ReferencedSeriesItem* refseriesItem = new IODSeriesAndInstanceReferenceMacro::ReferencedSeriesItem;
-
-    OFVector<SOPInstanceReferenceMacro*> &refinstances = refseriesItem->getReferencedInstanceItems();
-
-    OFString seriesInstanceUID, classUID;
-
-    CHECK_COND(dcmDatasets[0]->findAndGetOFString(DCM_SeriesInstanceUID, seriesInstanceUID));
-    CHECK_COND(refseriesItem->setSeriesInstanceUID(seriesInstanceUID));
-
-    FGPlanePosPatient* fgppp = FGPlanePosPatient::createMinimal("1","1","1");
-    FGFrameContent* fgfc = new FGFrameContent();
-    FGDerivationImage* fgder = new FGDerivationImage();
+    std::unique_ptr<FGPlanePosPatient> fgppp(FGPlanePosPatient::createMinimal("1","1","1"));
+    std::unique_ptr<FGFrameContent> fgfc(new FGFrameContent());
+    std::unique_ptr<FGDerivationImage> fgder(new FGDerivationImage());
     OFVector<FGBase*> perFrameFGs;
-
-    perFrameFGs.push_back(fgppp);
-    perFrameFGs.push_back(fgfc);
-    if(hasDerivationImages)
-      perFrameFGs.push_back(fgder);
 
     for (unsigned long sliceNumber = 0; result.good() && (sliceNumber < inputSize[2]); sliceNumber++) {
 
-      OFVector<DcmItem*> siVector;
-      for(size_t derImageInstanceNum=0;
-          derImageInstanceNum<slice2derimg[sliceNumber].size();
-          derImageInstanceNum++){
-        siVector.push_back(dcmDatasets[slice2derimg[sliceNumber][derImageInstanceNum]]);
-      }
+      perFrameFGs.clear();
+      perFrameFGs.push_back(fgppp.get());
+      perFrameFGs.push_back(fgfc.get());
 
-      int uidfound = 0, uidnotfound = 0;
-
-      if(siVector.size()>0){
-
-        set<OFString> instanceUIDs;
-
-        DerivationImageItem *derimgItem;
-
-        // TODO: I know David will not like this ...
-		DSRBasicCodedEntry code = CODE_DCM_ImageProcessing;
-        CodeSequenceMacro derivationCode = CodeSequenceMacro(code.CodeValue, code.CodingSchemeDesignator,
-			code.CodeMeaning);
+      // PerFrame FG: DerivationImageSequence, references the source frames
+      // this slice was derived from
+      bool frameHasReferences = false;
+      if(!slice2frames[sliceNumber].empty()){
 
         // Mandatory, defined in CID 7203
         // http://dicom.nema.org/medical/dicom/current/output/chtml/part16/sect_CID_7203.html
-        if(metaInfo.getDerivationCode() != NULL) {
-          CHECK_COND(fgder->addDerivationImageItem(*metaInfo.getDerivationCode(),
-                                                   metaInfo.getDerivationDescription().c_str(),
-                                                   derimgItem));
-        } else {
+        if(metaInfo.getDerivationCode() == NULL) {
           cerr << "ERROR: DerivationCode must be specified in the input metadata!" << endl;
           throw -1;
         }
 
-        OFVector<SourceImageItem*> srcimgItems;
-		DSRBasicCodedEntry code_src_img = CODE_DCM_SourceImageForImageProcessingOperation;
-
-        CHECK_COND(derimgItem->addSourceImageItems(siVector,
-                                                 CodeSequenceMacro(code_src_img.CodeValue, code_src_img.CodingSchemeDesignator,code_src_img.CodeMeaning),
-                                                 srcimgItems));
-
-        {
-          // initialize class UID and series instance UID
-          ImageSOPInstanceReferenceMacro &instRef = srcimgItems[0]->getImageSOPInstanceReference();
-          OFString instanceUID;
-
-          CHECK_COND(instRef.getReferencedSOPClassUID(classUID));
-          CHECK_COND(instRef.getReferencedSOPInstanceUID(instanceUID));
-
-          if(instanceUIDs.find(instanceUID) == instanceUIDs.end()){
-            SOPInstanceReferenceMacro *refinstancesItem = new SOPInstanceReferenceMacro();
-            CHECK_COND(refinstancesItem->setReferencedSOPClassUID(classUID));
-            CHECK_COND(refinstancesItem->setReferencedSOPInstanceUID(instanceUID));
-            refinstances.push_back(refinstancesItem);
-            instanceUIDs.insert(instanceUID);
-            uidnotfound++;
-          } else {
-            uidfound++;
-          }
-        }
-
+        DSRBasicCodedEntry code_src_img = CODE_DCM_SourceImageForImageProcessingOperation;
+        CHECK_COND(sourceIndex.addDerivationImageItem(*fgder, slice2frames[sliceNumber],
+            *metaInfo.getDerivationCode(), metaInfo.getDerivationDescription(),
+            CodeSequenceMacro(code_src_img.CodeValue, code_src_img.CodingSchemeDesignator, code_src_img.CodeMeaning)));
+        perFrameFGs.push_back(fgder.get());
+        frameHasReferences = true;
       }
 
       // addFrame
@@ -396,32 +339,21 @@ namespace dcmqi {
         // Frame Content
         OFCondition result = fgfc->setDimensionIndexValues(sliceNumber+1 /* value within dimension */, 0 /* first dimension */);
 
-#if ADD_DERIMG
-        // Already pushed above if siVector.size > 0
-        // if(fgder)
-          // perFrameFGs.push_back(fgder);
-#endif
-
         DPMParametricMapIOD::FramesType frames = pMapDoc->getFrames();
         result = OFget<DPMParametricMapIOD::Frames<FloatPixelType> >(&frames)->addFrame(&*data.begin(), frameSize, perFrameFGs);
 
         cout << "Frame " << sliceNumber << " added" << endl;
       }
 
-      // remove derivation image FG from the per-frame FGs, only if applicable!
-      if(!siVector.empty()){
-        // clean up for next frame
+      // clean up the derivation image FG for the next frame, only if applicable!
+      if(frameHasReferences){
         fgder->clearData();
       }
     }
 
-    // add ReferencedSeriesItem only if it is not empty
-    if(refinstances.size())
-      refseries.push_back(refseriesItem);
-
-    delete fgppp;
-    delete fgfc;
-    delete fgder;
+    // populate the Common Instance Reference module with the references
+    // accumulated while creating the derivation image items
+    CHECK_COND(sourceIndex.populateCommonInstanceReference(pMapDoc->getCommonInstanceReference()));
 
     string bodyPartAssigned = metaInfo.getBodyPartExamined();
     if(srcDataset != NULL && bodyPartAssigned.empty()) {
