@@ -34,7 +34,7 @@ jobs:
           vs-version: '17'
           msbuild-architecture: x64
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.10.11'
 
@@ -44,7 +44,7 @@ jobs:
 
       - name: Cache build dependencies
         id: cache-build-deps
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: |
             ${{ github.workspace }}\b\DCMTK
@@ -113,8 +113,8 @@ jobs:
       # the restore-keys prefix fallback above: a partial saved under any windows-deps-* key
       # would otherwise be resurrected on later runs and poison them.
       - name: Save build dependencies cache
-        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cache-build-deps.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v5
+        if: always() && steps.cache-build-deps.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
         with:
           path: |
             ${{ github.workspace }}\b\DCMTK
