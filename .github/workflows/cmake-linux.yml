@@ -13,9 +13,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  deployments: write
-  packages: write
+# Permissions are declared per job. A job-level block replaces the workflow-level one
+# rather than merging with it, so a workflow-level block here would have had no effect
+# on either job below -- and the macOS and Windows workflows already declare none.
 
 jobs:
   build-linux:
