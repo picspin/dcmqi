@@ -24,7 +24,7 @@ dcmqi is developed and maintained by the [NCI Imaging Data Commons](https://imag
 
 # Getting started
 
-* install as easy as `pip install dcmqi`
+* install as easy as `pip install dcmqi` — the wheels are built from this repository's release packages by [dcmqi-python-distributions](https://github.com/ImagingDataCommons/dcmqi-python-distributions)
 * for alternative installation and usage instructions see [dcmqi manual](https://qiicr.gitbook.io/dcmqi-guide/).
 * check out our [introductory tutorial](http://qiicr.org/dcmqi-guide/tutorials/intro.html)
 
