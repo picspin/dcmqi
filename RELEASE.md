@@ -40,6 +40,25 @@ source of truth.
      `CHANGELOG.md` and sets it as the release body. (If no matching section exists, that
      workflow fails loudly — go back to step 1.)
 
+   Five packages are attached, one per platform/architecture:
+
+   | Asset | Platform | Built by |
+   | --- | --- | --- |
+   | `dcmqi-X.Y.Z-linux.tar.gz` | Linux x86_64 | `cmake-linux` |
+   | `dcmqi-X.Y.Z-linux-arm64.tar.gz` | Linux arm64 | `cmake-linux` |
+   | `dcmqi-X.Y.Z-mac-x86_64.tar.gz` | macOS x86_64 | `cmake-macos` |
+   | `dcmqi-X.Y.Z-mac-arm64.tar.gz` | macOS arm64 | `cmake-macos` |
+   | `dcmqi-X.Y.Z-win64.zip` | Windows x86_64 | `cmake-win` |
+
+   The two x86_64 names are unqualified for historical reasons and must stay that way so
+   existing download URLs keep working; see `CPACK_SYSTEM_NAME` in `CMakeLists.txt`.
+
+   There is no Windows arm64 package yet: ITK's vendored GDCM does not compile for ARM64
+   with MSVC (`gdcmFilename.cxx` includes `<windows.h>` inside `namespace gdcm`, so the
+   `_Interlocked*` wrappers `winbase.h` declares on ARM64 land in that namespace and
+   collide). `CPACK_SYSTEM_NAME` below already names such a package correctly, so adding
+   the build job is all that remains once ITK carries the fix.
+
 You can leave the release body empty when publishing; the workflow fills it in. To
 preview what it will post: `python tools/changelog/generate_changelog.py --extract vX.Y.Z`.
 

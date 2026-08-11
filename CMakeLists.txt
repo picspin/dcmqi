@@ -412,12 +412,39 @@ else()
   set(CPACK_PACKAGE_VERSION_MAJOR ${DCMQI_VERSION_MAJOR})
   set(CPACK_PACKAGE_VERSION_MINOR ${DCMQI_VERSION_MINOR})
   set(CPACK_PACKAGE_VERSION_PATCH ${DCMQI_VERSION_PATCH})
+  # Normalized name of the architecture being built for. Visual Studio generators encode
+  # the target in the generator platform (-A), which is authoritative when it differs from
+  # the host, so it takes precedence over CMAKE_SYSTEM_PROCESSOR where it is set.
+  set(_target_arch "${CMAKE_SYSTEM_PROCESSOR}")
+  if(CMAKE_GENERATOR_PLATFORM)
+    set(_target_arch "${CMAKE_GENERATOR_PLATFORM}")
+  endif()
+  string(TOLOWER "${_target_arch}" _target_arch)
+  set(_target_is_arm64 FALSE)
+  if(_target_arch STREQUAL "arm64" OR _target_arch STREQUAL "aarch64")
+    set(_target_is_arm64 TRUE)
+  endif()
   if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
     set(CPACK_SYSTEM_NAME "mac-${CMAKE_SYSTEM_PROCESSOR}")
   elseif(CMAKE_SYSTEM_NAME MATCHES "Linux")
-    set(CPACK_SYSTEM_NAME "linux")
+    # The x86_64 package has always been published without an architecture suffix. It is
+    # deliberately left that way so existing download URLs keep working; only the newer
+    # architectures are qualified.
+    if(_target_is_arm64)
+      set(CPACK_SYSTEM_NAME "linux-arm64")
+    else()
+      set(CPACK_SYSTEM_NAME "linux")
+    endif()
   elseif(CMAKE_SYSTEM_NAME MATCHES "Windows")
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # Same rationale as Linux: "win64" keeps meaning x86_64.
+    #
+    # CI does not build Windows arm64 yet -- ITK's vendored GDCM does not compile for ARM64
+    # with MSVC -- but an ARM64 target is 64-bit, so without this branch such a build would
+    # silently produce a package named "win64" holding arm64 binaries. The check costs
+    # nothing and keeps a local ARM64 build honestly labelled.
+    if(_target_is_arm64)
+      set(CPACK_SYSTEM_NAME "win-arm64")
+    elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
       set(CPACK_SYSTEM_NAME win64)
     else()
       set(CPACK_SYSTEM_NAME win32)
