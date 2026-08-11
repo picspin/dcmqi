@@ -193,13 +193,19 @@ jobs:
 
     # Same layout and caching strategy as the macOS build: DCMTK/ITK need both their source
     # and build trees, zlib only its install tree.
+    #
+    # Paths below are deliberately workspace-relative, and the shell steps use
+    # $GITHUB_WORKSPACE rather than the ${{ github.workspace }} expression the other jobs use.
+    # In a container job the two disagree: the expression is evaluated on the host and yields
+    # /home/runner/work/..., while the repository is mounted inside the container at /__w/....
+    # Using the expression here silently operates on an empty host path.
     - name: "Prepare cache directories"
       run: |
-        mkdir -p ${{ github.workspace }}/dcmqi-build/DCMTK-build
-        mkdir -p ${{ github.workspace }}/dcmqi-build/DCMTK
-        mkdir -p ${{ github.workspace }}/dcmqi-build/ITK
-        mkdir -p ${{ github.workspace }}/dcmqi-build/ITK-build
-        mkdir -p ${{ github.workspace }}/dcmqi-build/zlib-install
+        mkdir -p "$GITHUB_WORKSPACE"/dcmqi-build/DCMTK-build
+        mkdir -p "$GITHUB_WORKSPACE"/dcmqi-build/DCMTK
+        mkdir -p "$GITHUB_WORKSPACE"/dcmqi-build/ITK
+        mkdir -p "$GITHUB_WORKSPACE"/dcmqi-build/ITK-build
+        mkdir -p "$GITHUB_WORKSPACE"/dcmqi-build/zlib-install
 
     - name: Check for cached DCMTK, ITK and ZLIB
       id: cache-dcmtk-itk-zlib
@@ -208,11 +214,11 @@ jobs:
         cache-name: cache-dcmtk-itk-zlib-v2
       with:
         path: |
-          ${{ github.workspace }}/dcmqi-build/DCMTK
-          ${{ github.workspace }}/dcmqi-build/DCMTK-build
-          ${{ github.workspace }}/dcmqi-build/ITK
-          ${{ github.workspace }}/dcmqi-build/ITK-build
-          ${{ github.workspace }}/dcmqi-build/zlib-install
+          dcmqi-build/DCMTK
+          dcmqi-build/DCMTK-build
+          dcmqi-build/ITK
+          dcmqi-build/ITK-build
+          dcmqi-build/zlib-install
         key: ${{ runner.os }}-arm64-manylinux_2_28-build-${{ env.cache-name }}-${{ hashFiles('CMakeExternals/DCMTK.cmake','CMakeExternals/ITK.cmake', 'CMakeExternals/zlib.cmake') }}
 
     - name: Report cache status
@@ -220,7 +226,7 @@ jobs:
         if [ "${{ steps.cache-dcmtk-itk-zlib.outputs.cache-hit }}" == "true" ]; then
           echo "✓ Cache hit! Using cached DCMTK, ITK, and zlib"
           echo "Cache key: ${{ steps.cache-dcmtk-itk-zlib.outputs.cache-primary-key }}"
-          du -sh ${{ github.workspace }}/dcmqi-build/DCMTK* ${{ github.workspace }}/dcmqi-build/ITK* ${{ github.workspace }}/dcmqi-build/zlib-install 2>/dev/null || true
+          du -sh "$GITHUB_WORKSPACE"/dcmqi-build/DCMTK* "$GITHUB_WORKSPACE"/dcmqi-build/ITK* "$GITHUB_WORKSPACE"/dcmqi-build/zlib-install 2>/dev/null || true
         else
           echo "✗ Cache miss. Will build DCMTK, ITK, and zlib from source"
         fi
@@ -265,28 +271,28 @@ jobs:
     - name: "Configure dcmqi w/ cached DCMTK/ITK/ZLIB"
       if: ${{ steps.cache-dcmtk-itk-zlib.outputs.cache-hit == 'true' && steps.validate-cache.outputs.cache_ok == 'true' }}
       run: |
-        cd ${{ github.workspace }}/dcmqi-build && cmake -G Ninja ${{ github.workspace }} -DCMAKE_BUILD_TYPE:STRING=Release -DPython3_EXECUTABLE:FILEPATH=$PYTHON -DDCMTK_DIR=${{ github.workspace }}/dcmqi-build/DCMTK-build -DITK_DIR=${{ github.workspace }}/dcmqi-build/ITK-build -DZLIB_ROOT=${{ github.workspace }}/dcmqi-build/zlib-install
+        cd "$GITHUB_WORKSPACE"/dcmqi-build && cmake -G Ninja "$GITHUB_WORKSPACE" -DCMAKE_BUILD_TYPE:STRING=Release -DPython3_EXECUTABLE:FILEPATH="$PYTHON" -DDCMTK_DIR="$GITHUB_WORKSPACE"/dcmqi-build/DCMTK-build -DITK_DIR="$GITHUB_WORKSPACE"/dcmqi-build/ITK-build -DZLIB_ROOT="$GITHUB_WORKSPACE"/dcmqi-build/zlib-install
 
     - name: "Configure dcmqi w/o cached DCMTK/ITK/ZLIB"
       if: ${{ steps.cache-dcmtk-itk-zlib.outputs.cache-hit != 'true' || steps.validate-cache.outputs.cache_ok != 'true' }}
       run: |
-        cd ${{ github.workspace }}/dcmqi-build && cmake -G Ninja ${{ github.workspace }} -DCMAKE_BUILD_TYPE:STRING=Release -DPython3_EXECUTABLE:FILEPATH=$PYTHON
+        cd "$GITHUB_WORKSPACE"/dcmqi-build && cmake -G Ninja "$GITHUB_WORKSPACE" -DCMAKE_BUILD_TYPE:STRING=Release -DPython3_EXECUTABLE:FILEPATH="$PYTHON"
 
     - name: "Build dcmqi"
       id: build
       run: |
-        cd ${{ github.workspace }}/dcmqi-build && ninja
+        cd "$GITHUB_WORKSPACE"/dcmqi-build && ninja
 
     # The dciodvfy (dicom3tools) and ajv tests are skipped here, exactly as they are on
     # macOS: both are optional and CMake drops them when the executables are absent.
     - name: "Test dcmqi"
       run: |
-        cd ${{ github.workspace }}/dcmqi-build/dcmqi-build
+        cd "$GITHUB_WORKSPACE"/dcmqi-build/dcmqi-build
         ctest -j4 -D ExperimentalTest -VV --no-compress-output
 
     - name: "Package dcmqi"
       run: |
-        cd ${{ github.workspace }}/dcmqi-build/dcmqi-build && ninja package
+        cd "$GITHUB_WORKSPACE"/dcmqi-build/dcmqi-build && ninja package
 
     - name: "Upload package as artifact"
       id: upload-artifact
@@ -294,14 +300,14 @@ jobs:
       continue-on-error: true
       with:
         name: dcmqi-linux-arm64-package
-        path: ${{ github.workspace }}/dcmqi-build/dcmqi-build/dcmqi-*-linux-arm64*.tar.gz
+        path: dcmqi-build/dcmqi-build/dcmqi-*-linux-arm64*.tar.gz
 
     - name: "Upload package as artifact (retry)"
       if: steps.upload-artifact.outcome == 'failure'
       uses: actions/upload-artifact@v7
       with:
         name: dcmqi-linux-arm64-package
-        path: ${{ github.workspace }}/dcmqi-build/dcmqi-build/dcmqi-*-linux-arm64*.tar.gz
+        path: dcmqi-build/dcmqi-build/dcmqi-*-linux-arm64*.tar.gz
 
     # Save the dependency cache only when the build step itself succeeded. This keeps the
     # original intent -- cache the deps even if a *later* step (test, package) fails -- while
@@ -315,11 +321,11 @@ jobs:
       uses: actions/cache/save@v6
       with:
         path: |
-          ${{ github.workspace }}/dcmqi-build/DCMTK
-          ${{ github.workspace }}/dcmqi-build/DCMTK-build
-          ${{ github.workspace }}/dcmqi-build/ITK
-          ${{ github.workspace }}/dcmqi-build/ITK-build
-          ${{ github.workspace }}/dcmqi-build/zlib-install
+          dcmqi-build/DCMTK
+          dcmqi-build/DCMTK-build
+          dcmqi-build/ITK
+          dcmqi-build/ITK-build
+          dcmqi-build/zlib-install
         key: ${{ steps.cache-dcmtk-itk-zlib.outputs.cache-primary-key }}
 
     - name: "Publish linux-arm64 package"
@@ -336,13 +342,17 @@ jobs:
         if [ -n "$TAG" ] && [ "$TAG" != "latest" ]; then
           # Unlike the GitHub-hosted images, the manylinux container has no GitHub CLI, so
           # fetch the static arm64 build to keep this step identical to the other platforms.
-          gh_version=$(curl -sSL https://api.github.com/repos/cli/cli/releases/latest \
-            | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -n 1)
-          curl -sSL "https://github.com/cli/cli/releases/download/v${gh_version}/gh_${gh_version}_linux_arm64.tar.gz" \
+          # The version is pinned rather than discovered, as ninja is in the macOS build:
+          # it keeps the step reproducible and avoids an unauthenticated API call subject to
+          # the low anonymous rate limit. --proto pins the transfer, and every redirect, to
+          # https so a redirect cannot silently downgrade the download.
+          GH_CLI_VERSION=2.97.0
+          curl -sSL --proto '=https' --proto-redir '=https' \
+            "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_arm64.tar.gz" \
             | tar -xz -C /tmp
-          export PATH="/tmp/gh_${gh_version}_linux_arm64/bin:$PATH"
+          export PATH="/tmp/gh_${GH_CLI_VERSION}_linux_arm64/bin:$PATH"
 
           gh release upload "$TAG" \
-            ${{ github.workspace }}/dcmqi-build/dcmqi-build/dcmqi-*-linux-arm64.tar.gz \
+            "$GITHUB_WORKSPACE"/dcmqi-build/dcmqi-build/dcmqi-*-linux-arm64.tar.gz \
             --clobber
         fi
