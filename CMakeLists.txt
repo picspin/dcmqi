@@ -437,6 +437,11 @@ else()
     endif()
   elseif(CMAKE_SYSTEM_NAME MATCHES "Windows")
     # Same rationale as Linux: "win64" keeps meaning x86_64.
+    #
+    # CI does not build Windows arm64 yet -- ITK's vendored GDCM does not compile for ARM64
+    # with MSVC -- but an ARM64 target is 64-bit, so without this branch such a build would
+    # silently produce a package named "win64" holding arm64 binaries. The check costs
+    # nothing and keeps a local ARM64 build honestly labelled.
     if(_target_is_arm64)
       set(CPACK_SYSTEM_NAME "win-arm64")
     elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)

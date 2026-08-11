@@ -13,11 +13,10 @@ name: Finalize latest prerelease
 #     directories never accumulate.
 # This mirrors what scikit-ci-addons' publish_github_release used to do for us.
 #
-# A delete+recreate must not run inside the six parallel build jobs (linux, linux-arm64,
-# mac-arm64, mac-x86_64, win64, win-arm64) or they would wipe each other's assets, so it
-# lives here as a single coordinator that runs after the builds. GITHUB_TOKEN is used on
-# purpose: release/tag events it creates do not trigger other workflows, so there is no
-# build loop.
+# A delete+recreate must not run inside the five parallel build jobs (linux, linux-arm64,
+# mac-arm64, mac-x86_64, win) or they would wipe each other's assets, so it lives here as
+# a single coordinator that runs after the builds. GITHUB_TOKEN is used on purpose:
+# release/tag events it creates do not trigger other workflows, so there is no build loop.
 on:
   workflow_run:
     workflows:

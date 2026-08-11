@@ -17,35 +17,13 @@ jobs:
 
   build-windows:
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: windows-2022
     timeout-minutes: 360
 
     permissions:
       contents: write
       actions: write
       packages: write
-
-    strategy:
-      # Keep building the other architecture when one fails, as on macOS.
-      fail-fast: false
-      matrix:
-        include:
-          # "win64" has always meant x86_64 and is left unqualified so existing download
-          # URLs keep working; see CPACK_SYSTEM_NAME in CMakeLists.txt.
-          - arch: x64
-            runner: windows-2022
-            cmake_platform: x64
-            msbuild_arch: x64
-            python_version: '3.10.11'
-            package_name: win64
-          - arch: arm64
-            runner: windows-11-arm
-            cmake_platform: ARM64
-            msbuild_arch: arm64
-            # python.org publishes Windows arm64 builds starting with 3.11, so the arm64
-            # runner cannot use the 3.10 pinned for x64.
-            python_version: '3.12'
-            package_name: win-arm64
 
     steps:
       - uses: actions/checkout@v7
@@ -54,11 +32,11 @@ jobs:
       - uses: microsoft/setup-msbuild@v3
         with:
           vs-version: '17'
-          msbuild-architecture: ${{ matrix.msbuild_arch }}
+          msbuild-architecture: x64
 
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python_version }}
+          python-version: '3.10.11'
 
       - name: Install prerequisite python packages
         run: |
@@ -81,9 +59,9 @@ jobs:
             ${{ github.workspace }}\b\zlib-build
             ${{ github.workspace }}\b\zlib-install
             ${{ github.workspace }}\b\zlib-prefix
-          key: windows-${{ matrix.arch }}-deps-${{ hashFiles('CMakeExternals/*.cmake') }}
+          key: windows-deps-${{ hashFiles('CMakeExternals/*.cmake') }}
           restore-keys: |
-            windows-${{ matrix.arch }}-deps-
+            windows-deps-
 
       - name: Configure project
 
@@ -95,10 +73,9 @@ jobs:
           echo "Step 2"
           cd ${{ github.workspace }}\b
           echo "Step 3"
-          cmake -G "Visual Studio 17 2022" -A${{ matrix.cmake_platform }} -DBUILD_SHARED_LIBS:BOOL=OFF ${{ github.workspace }}
+          cmake -G "Visual Studio 17 2022" -Ax64 -DBUILD_SHARED_LIBS:BOOL=OFF ${{ github.workspace }}
 
       - name: Build dcmqi
-        id: build
         run: |
           cd ${{ github.workspace }}\b/
           cmake --build . --config Release -- /m
@@ -118,22 +95,17 @@ jobs:
         uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
-            name: dcmqi-windows-${{ matrix.arch }}-package
-            path: ${{ github.workspace }}\b\dcmqi-build\dcmqi-*-${{ matrix.package_name }}*.zip
+            name: dcmqi-build
+            path: ${{ github.workspace }}\b\dcmqi-build\dcmqi-*-win64*.zip
 
       - name: "Upload package as artifact (retry)"
         if: steps.upload-artifact.outcome == 'failure'
         uses: actions/upload-artifact@v7
         with:
-            name: dcmqi-windows-${{ matrix.arch }}-package
-            path: ${{ github.workspace }}\b\dcmqi-build\dcmqi-*-${{ matrix.package_name }}*.zip
+            name: dcmqi-build
+            path: ${{ github.workspace }}\b\dcmqi-build\dcmqi-*-win64*.zip
 
-      # Save the dependency cache only when the build step itself succeeded. This keeps the
-      # original intent -- cache the deps even if a *later* step (test, package) fails -- while
-      # never snapshotting a half-built tree when the build is cancelled (e.g. by the
-      # cancel-in-progress concurrency rule) or fails partway. This matters more here because of
-      # the restore-keys prefix fallback above: a partial saved under any windows-deps-* key
-      # would otherwise be resurrected on later runs and poison them.
+      # Save cache even if a later step (test, package) failed, so deps don't need rebuilding next run
       - name: Save build dependencies cache
         if: always() && steps.cache-build-deps.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -168,6 +140,6 @@ jobs:
           TAG=$(git describe --tags --exact-match 2>/dev/null || echo "")
           if [ -n "$TAG" ] && [ "$TAG" != "latest" ]; then
             gh release upload "$TAG" \
-              "${{ github.workspace }}/b/dcmqi-build"/dcmqi-*-${{ matrix.package_name }}.zip \
+              "${{ github.workspace }}/b/dcmqi-build"/dcmqi-*-win64.zip \
               --clobber
           fi
