@@ -188,7 +188,7 @@ jobs:
     # skipped and the broken entry is never overwritten. `!cancelled()` keeps this step
     # eligible after a failed test/package; `steps.build.outcome` does the real gating.
     - name: Save DCMTK, ITK and ZLIB cache
-      if: always() && steps.cache-dcmtk-itk-zlib.outputs.cache-hit != 'true'
+      if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cache-dcmtk-itk-zlib.outputs.cache-hit != 'true' }}
       uses: actions/cache/save@v6
       with:
         path: |

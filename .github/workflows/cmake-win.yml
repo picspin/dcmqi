@@ -113,7 +113,7 @@ jobs:
       # the restore-keys prefix fallback above: a partial saved under any windows-deps-* key
       # would otherwise be resurrected on later runs and poison them.
       - name: Save build dependencies cache
-        if: always() && steps.cache-build-deps.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && steps.cache-build-deps.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v6
         with:
           path: |
