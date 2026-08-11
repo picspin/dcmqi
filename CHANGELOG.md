@@ -10,6 +10,18 @@ within the same release. New releases are appended with the same tool -- see
 `tools/changelog/`. The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 
+## [1.5.7](https://github.com/QIICR/dcmqi/releases/tag/v1.5.7) - 2026-08-11
+
+Packaging only; no library changes since 1.5.6.
+
+### Added
+- arm64 Linux package `dcmqi-1.5.7-linux-arm64.tar.gz`, built natively in a `manylinux_2_28_aarch64` container (glibc 2.28+). Windows arm64 is still unavailable: ITK's vendored GDCM does not compile for ARM64 with MSVC ([#556](https://github.com/QIICR/dcmqi/pull/556), @fedorov)
+
+### Fixed
+- CI no longer saves a dependency cache from a cancelled or failed build ([#550](https://github.com/QIICR/dcmqi/pull/550), [#555](https://github.com/QIICR/dcmqi/pull/555), @fedorov)
+
+_[Full set of changes](https://github.com/QIICR/dcmqi/compare/v1.5.6...v1.5.7)_
+
 ## [1.5.6](https://github.com/QIICR/dcmqi/releases/tag/v1.5.6) - 2026-06-25
 
 ### Fixed
