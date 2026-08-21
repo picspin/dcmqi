@@ -577,6 +577,400 @@ namespace dcmqi {
       }
     }
 
+    /** Turns a set of ITK segmentation images into a DICOM Segmentation object.
+     *
+     *  Written as a class rather than a function because the individual steps
+     *  of the conversion share a substantial amount of state - the document
+     *  being built, the source image inventory and the mapping derived from it,
+     *  the segment numbering, the functional groups reused for every frame -
+     *  which as plain locals would have to be threaded through every step as a
+     *  dozen or more parameters. As members, each step reduces to what it
+     *  actually does.
+     *
+     *  Derives privately from ConverterBase only to reach its protected
+     *  helpers for the equipment and content identification defaults.
+     */
+    template<class ImageSourceType>
+    class SegmentationEncoder : private ConverterBase {
+
+    public:
+
+      /** The conversion flags of itkimage2dcmSegmentation(), see there for
+       *  their documentation */
+      struct Options {
+        bool skipEmptySlices;
+        bool useLabelIDAsSegmentNumber;
+        bool referencesGeometryCheck;
+        bool doDicomValueChecks;
+        bool outputLabelMap;
+      };
+
+      /** @param dcmDatasets   Source images the segmentation is based on.
+       *  @param segmentations The segmentation images to convert.
+       *  @param metaInfo      Metadata describing the segments.
+       *  @param options       Conversion flags.
+       *  The referenced objects must outlive this encoder.
+       */
+      SegmentationEncoder(const vector<DcmItem*>& dcmDatasets,
+                          const vector<itk::SmartPointer<const ImageSourceType> >& segmentations,
+                          JSONSegmentationMetaInformationHandler& metaInfo,
+                          const Options& options)
+        : m_dcmDatasets(dcmDatasets),
+          m_segmentations(segmentations),
+          m_metaInfo(metaInfo),
+          m_options(options),
+          m_inputSize(segmentations[0]->GetBufferedRegion().GetSize()),
+          m_frameSize(m_inputSize[0] * m_inputSize[1]),
+          m_labelmapUse16Bit(false),
+          // Inventory of the source images, used to map slices of the
+          // segmentation to the source frames and to create the references
+          // derived from that mapping
+          m_sourceIndex(dcmDatasets),
+          // Assigns the Segment Numbers written to DICOM and keeps the mappings
+          // derived from them (label ID per segment number for the re-mapping
+          // after writing, and the labelmap pixel value per input label).
+          // Segment numbers always start at 1; pixel value 0 in labelmap output
+          // is reserved for background per Sup 243, and a background segment
+          // with number 0 (designated via Pixel Padding Value) is added later
+          // if needed.
+          m_segmentNumbers(options.useLabelIDAsSegmentNumber, options.outputLabelMap, segmentations.size()),
+          m_hasDerivationImagesAny(false),
+          m_framesAdded(0)
+      {
+      }
+
+      /** Run the conversion.
+       *  @return The resulting dataset, which the caller owns, or NULL on failure.
+       */
+      DcmDataset* encode() {
+        if(m_metaInfo.segmentsAttributesMappingList.size() != m_segmentations.size()){
+          cerr << "Mismatch between the number of input segmentation files and the size of metainfo list!" << endl;
+          return NULL;
+        }
+
+        if(!createDocument())
+          return NULL;
+        addSharedFunctionalGroups();
+        mapSourceFrames();
+
+        if(!encodeSegments())
+          return NULL;
+        if(m_options.outputLabelMap)
+        {
+          if(!encodeLabelmapFrames())
+            return NULL;
+          // designate pixel value 0 as background (Background segment plus
+          // Pixel Padding Value) if it occurs in any frame
+          CHECK_COND(addBackgroundSegmentIfNeeded(m_segdoc.get()));
+        }
+
+        if(m_framesAdded == 0){
+          cerr << "FATAL ERROR: No input labels found - input segmentation is empty!" << endl;
+          cerr << "If you would like to encode background label, please see https://github.com/QIICR/dcmqi/issues/490" << endl;
+          return NULL;
+        }
+
+        return writeDocument();
+      }
+
+      /** Mapping from assigned Segment Number to the label ID it came from,
+       *  for the caller-side re-mapping of binary segmentations */
+      const map<Uint16, Uint16>& segmentToLabel() const { return m_segmentNumbers.segmentToLabel(); }
+
+    private:
+
+      /** Create the segmentation document and initialize what it inherits from
+       *  the source images and the metadata */
+      bool createDocument() {
+        // Get equipment and content identification information from the metadata handler.
+        // Contains constant dcmqi defaults for equipment and content identification.
+        // These are used to create the DICOM Segmentation object.
+        IODGeneralEquipmentModule::EquipmentInfo eq = getEquipmentInfo();
+        ContentIdentificationMacro ident = createContentIdentificationInformation(m_metaInfo);
+        CHECK_COND(ident.setInstanceNumber(m_metaInfo.getInstanceNumber().c_str()));
+
+        if(m_options.outputLabelMap && !m_segmentNumbers.determineLabelmapBitDepth(m_metaInfo, m_labelmapUse16Bit))
+          return false;
+        m_segdoc.reset(createSegmentationDocument(m_inputSize[1], m_inputSize[0], m_options.outputLabelMap,
+                                                  m_labelmapUse16Bit, eq, ident));
+        if(!m_segdoc)
+          return false;
+
+        // import Patient, Study and Frame of Reference; do not import Series
+        // attributes
+        CHECK_COND(m_segdoc->importHierarchy(*m_dcmDatasets[0], OFTrue, OFTrue, OFTrue, OFFalse));
+
+        initializeDimensions(*m_segdoc, m_options.outputLabelMap);
+        return true;
+      }
+
+      /** Initialize the functional groups that apply to every frame */
+      void addSharedFunctionalGroups() {
+        addGeometrySharedFGs(*m_segdoc, *m_segmentations[0]);
+
+        // Shared FGs: DerivationImageSequence
+        // When geometry checks are disabled, all source images are referenced as
+        // whole instances by all frames.
+        if(!m_options.referencesGeometryCheck && m_dcmDatasets.size() > 1){
+          FGDerivationImage fgderShared;
+          CHECK_COND(m_sourceIndex.addWholeInstanceDerivationImageItem(fgderShared,
+              segmentationDerivationCode(), "", segmentationDerivationCode()));
+          CHECK_COND(m_segdoc->addForAllFrames(fgderShared));
+        }
+      }
+
+      /** Map the slices of each segmentation file to the source frames located on them */
+      void mapSourceFrames() {
+        if(!m_options.referencesGeometryCheck)
+          return;
+        m_slice2framesPerFile.resize(m_segmentations.size());
+        for (size_t segFileNumber = 0; segFileNumber < m_segmentations.size(); segFileNumber++)
+        {
+          m_slice2framesPerFile[segFileNumber] = m_sourceIndex.mapSlicesToFrames(*m_segmentations[segFileNumber]);
+          for (vector<vector<size_t> >::const_iterator vI = m_slice2framesPerFile[segFileNumber].begin();
+               vI != m_slice2framesPerFile[segFileNumber].end(); ++vI)
+            if ((*vI).size() > 0)
+              m_hasDerivationImagesAny = true;
+        }
+      }
+
+      /** Iterate over the files and the labels available in each file and create
+       *  a segment for every label. For binary output the frames of a segment
+       *  are written right away; labelmap output composes its frames from all
+       *  segments afterwards, see encodeLabelmapFrames().
+       */
+      bool encodeSegments() {
+        for(size_t segFileNumber=0; segFileNumber<m_segmentations.size(); segFileNumber++){
+
+          // note that labels are the same in the input and output image produced
+          // by this filter, see https://itk.org/Doxygen/html/classitk_1_1LabelImageToLabelMapFilter.html
+          using LabelToLabelMapFilterType2 = itk::LabelImageToLabelMapFilter<ImageSourceType>;
+          typename LabelToLabelMapFilterType2::Pointer l2lm = LabelToLabelMapFilterType2::New();
+          l2lm->SetInput(m_segmentations[segFileNumber]);
+          l2lm->Update();
+
+          typedef typename LabelToLabelMapFilterType2::OutputImageType::LabelObjectType LabelType;
+          typedef itk::LabelStatisticsImageFilter<ImageSourceType,ImageSourceType> LabelStatisticsType;
+
+          typename LabelStatisticsType::Pointer labelStats = LabelStatisticsType::New();
+
+          cout << "Found " << l2lm->GetOutput()->GetNumberOfLabelObjects() << " label(s)" << endl;
+          labelStats->SetInput(m_segmentations[segFileNumber]);
+          labelStats->SetLabelInput(m_segmentations[segFileNumber]);
+          labelStats->Update();
+
+          for(unsigned segLabelNumber=0 ; segLabelNumber<l2lm->GetOutput()->GetNumberOfLabelObjects();segLabelNumber++){
+            LabelType* labelObject = l2lm->GetOutput()->GetNthLabelObject(segLabelNumber);
+            short label = labelObject->GetLabel();
+
+            if(!label){
+              continue;
+            }
+
+            cout << "Processing label " << label << endl;
+
+            auto bbox = labelStats->GetBoundingBox(label);
+            unsigned firstSlice, lastSlice;
+            if(m_options.skipEmptySlices){
+              firstSlice = bbox[4];
+              lastSlice = bbox[5]+1;
+            } else {
+              firstSlice = 0;
+              lastSlice = m_inputSize[2];
+            }
+
+            cout << "Total non-empty slices that will be encoded in SEG for label " <<
+            label << " is " << lastSlice-firstSlice+1 << endl <<
+            " (inclusive from " << firstSlice << " to " <<
+            lastSlice << ")" << endl;
+
+            if(m_metaInfo.segmentsAttributesMappingList[segFileNumber].find(label) == m_metaInfo.segmentsAttributesMappingList[segFileNumber].end()){
+              cerr << "ERROR: Failed to match label from image to the segment metadata!" << endl;
+              return false;
+            }
+
+            DcmSegment* segment = createSegmentFromAttributes(*m_metaInfo.segmentsAttributesMappingList[segFileNumber][label]);
+            if(!segment)
+              return false;
+
+            Uint16 segmentNumber = 0;
+            if (!m_segmentNumbers.proposeSegmentNumber(label, segmentNumber))
+            {
+              delete segment;
+              return false;
+            }
+            CHECK_COND(m_segdoc->addSegment(segment, segmentNumber /* returns logical segment number */));
+            m_segmentNumbers.recordSegment(segFileNumber, label, segmentNumber);
+
+            if (!m_options.outputLabelMap)
+              addBinaryFrames(segFileNumber, label, segmentNumber, firstSlice, lastSlice);
+          }
+        }
+        return true;
+      }
+
+      /** Write the frames of one segment of a binary segmentation, one per slice
+       *  of the given range */
+      void addBinaryFrames(const size_t segFileNumber, const short label, const Uint16 segmentNumber,
+                           const unsigned firstSlice, const unsigned lastSlice) {
+        for(unsigned sliceNumber=firstSlice;sliceNumber<lastSlice;sliceNumber++){
+
+          m_perFrameFGs.beginFrame();
+
+          // PerFrame FG: FrameContentSequence
+          CHECK_COND(m_perFrameFGs.frameContent().setDimensionIndexValues(segmentNumber, 0));
+          CHECK_COND(m_perFrameFGs.frameContent().setDimensionIndexValues(sliceNumber-firstSlice+1, 1));
+
+          // PerFrame FG: PlanePositionSequence
+          setPlanePositionToSlice(m_perFrameFGs.planePosition(), *m_segmentations[segFileNumber], sliceNumber);
+
+          // PerFrame FG: DerivationImageSequence, references the source frames
+          // this slice was derived from
+          if(m_options.referencesGeometryCheck && !m_slice2framesPerFile[segFileNumber][sliceNumber].empty()){
+            CHECK_COND(m_sourceIndex.addDerivationImageItem(m_perFrameFGs.derivationImage(),
+                m_slice2framesPerFile[segFileNumber][sliceNumber],
+                segmentationDerivationCode(), "", sourceImagePurposeOfReferenceCode()));
+          }
+
+          /* Add frame that references this segment */
+          vector<Uint8> frameData = extractBinaryFrame(*m_segmentations[segFileNumber], label, sliceNumber, m_frameSize);
+          OFCondition frameAdded = m_segdoc->addFrame(frameData.data(), segmentNumber, m_perFrameFGs.get());
+          if(frameAdded.good()){
+            m_framesAdded++;
+          }
+          m_perFrameFGs.endFrame();
+        }
+      }
+
+      /** Compose and write the frames of a labelmap segmentation, one per slice,
+       *  merging the segments of all input files into a single frame */
+      bool encodeLabelmapFrames() {
+        unsigned outputFrameNumber = 1;
+
+        // Stack ID is invariant across all labelmap frames; set it once on the
+        // reused FGFrameContent instance.
+        CHECK_COND(m_perFrameFGs.frameContent().setStackID("Frame Position"));
+
+        for (unsigned sliceNumber = 0; sliceNumber < m_inputSize[2]; sliceNumber++)
+        {
+          std::vector<Uint8> frameData8;
+          std::vector<Uint16> frameData16;
+          bool frameHasForeground = false;
+          if (!composeLabelmapFrame(m_segmentations, m_segmentNumbers, sliceNumber, m_frameSize,
+                                    m_labelmapUse16Bit, frameData8, frameData16, frameHasForeground))
+            return false;
+
+          if (m_options.skipEmptySlices && !frameHasForeground)
+            continue;
+
+          m_perFrameFGs.beginFrame();
+
+          CHECK_COND(m_perFrameFGs.frameContent().setInStackPositionNumber(outputFrameNumber));
+          CHECK_COND(m_perFrameFGs.frameContent().setDimensionIndexValues(1, 0));
+          CHECK_COND(m_perFrameFGs.frameContent().setDimensionIndexValues(outputFrameNumber, 1));
+
+          setPlanePositionToSlice(m_perFrameFGs.planePosition(), *m_segmentations[0], sliceNumber);
+
+          addLabelmapFrameReferences(sliceNumber);
+
+          OFCondition frameAdded = m_labelmapUse16Bit
+              ? m_segdoc->addFrame(frameData16.data(), 0, m_perFrameFGs.get())
+              : m_segdoc->addFrame(frameData8.data(), 0, m_perFrameFGs.get());
+          if (frameAdded.good())
+          {
+            m_framesAdded++;
+            outputFrameNumber++;
+          }
+          m_perFrameFGs.endFrame();
+        }
+        return true;
+      }
+
+      /** PerFrame FG: DerivationImageSequence of a labelmap frame, referencing
+       *  the source frames of this slice across all segmentation files */
+      void addLabelmapFrameReferences(const unsigned sliceNumber) {
+        if (!m_options.referencesGeometryCheck || !m_hasDerivationImagesAny || m_slice2framesPerFile.empty())
+          return;
+
+        std::set<size_t> referencedFrameIds;
+        for (size_t segFileNumber = 0; segFileNumber < m_slice2framesPerFile.size(); segFileNumber++)
+        {
+          if (sliceNumber >= m_slice2framesPerFile[segFileNumber].size())
+            continue;
+          referencedFrameIds.insert(m_slice2framesPerFile[segFileNumber][sliceNumber].begin(),
+                                    m_slice2framesPerFile[segFileNumber][sliceNumber].end());
+        }
+        if (referencedFrameIds.empty())
+          return;
+
+        vector<size_t> frameIds(referencedFrameIds.begin(), referencedFrameIds.end());
+        CHECK_COND(m_sourceIndex.addDerivationImageItem(m_perFrameFGs.derivationImage(), frameIds,
+            segmentationDerivationCode(), "", sourceImagePurposeOfReferenceCode()));
+      }
+
+      /** Complete the document and write it out, including the attributes that
+       *  have to be patched into the written dataset */
+      DcmDataset* writeDocument() {
+        // populate the Common Instance Reference module with the references
+        // accumulated while creating the derivation image items
+        CHECK_COND(m_sourceIndex.populateCommonInstanceReference(m_segdoc->getCommonInstanceReference()));
+
+        m_segdoc->getSeries().setSeriesNumber(m_metaInfo.getSeriesNumber().c_str());
+
+        OFString frameOfRefUID;
+        if(!m_segdoc->getFrameOfReference().getFrameOfReferenceUID(frameOfRefUID).good()){
+          // TODO: add FoR UID to the metadata JSON and check that before generating one!
+          char frameOfRefUIDchar[128];
+          dcmGenerateUniqueIdentifier(frameOfRefUIDchar, QIICR_UID_ROOT);
+          CHECK_COND(m_segdoc->getFrameOfReference().setFrameOfReferenceUID(frameOfRefUIDchar));
+        }
+
+        std::cout << "Writing DICOM segmentation dataset" << std::endl;
+        // Don't check functional groups since its very time consuming and we trust
+        // ourselves to put together valid datasets
+        m_segdoc->setCheckFGOnWrite(OFFalse);
+
+        // Ensure dataset memory is cleaned up on exit, and avoid the copy on
+        // return that was performed before
+        std::unique_ptr<DcmDataset> segdocDataset(new DcmDataset());
+        std::cout << "Checking DICOM attribute values before writing: "
+                  << (m_options.doDicomValueChecks ? "enabled" : "disabled") << std::endl;
+        m_segdoc->setValueCheckOnWrite(m_options.doDicomValueChecks);
+        OFCondition writeResult = m_segdoc->writeDataset(*segdocDataset);
+        if(writeResult.bad()){
+          cerr << "FATAL ERROR: Writing of the SEG dataset failed!";
+          if (writeResult.text()){
+            cerr << " Error: " << writeResult.text() << ".";
+          }
+          cerr << " Please report the problem to the developers, ideally accompanied by a de-identified dataset allowing to reproduce the problem!" << endl;
+          return NULL;
+        }
+
+        patchDerivedAttributes(*segdocDataset, *m_segdoc, m_metaInfo, *m_dcmDatasets[0],
+                               m_options.outputLabelMap, m_segmentations.size());
+        return segdocDataset.release();
+      }
+
+      // inputs
+      const vector<DcmItem*>& m_dcmDatasets;
+      const vector<itk::SmartPointer<const ImageSourceType> >& m_segmentations;
+      JSONSegmentationMetaInformationHandler& m_metaInfo;
+      const Options m_options;
+      const itk::ImageBase<3>::SizeType m_inputSize;
+      const unsigned m_frameSize;
+
+      // conversion state
+      std::unique_ptr<DcmSegmentation> m_segdoc;
+      bool m_labelmapUse16Bit;
+      SourceImageIndex m_sourceIndex;
+      SegmentNumberAssigner m_segmentNumbers;
+      /// per input file and slice, the source frames located on that slice
+      vector<vector<vector<size_t> > > m_slice2framesPerFile;
+      bool m_hasDerivationImagesAny;
+      PerFrameFunctionalGroups m_perFrameFGs;
+      unsigned m_framesAdded;
+    };
+
   } // anonymous namespace
 
 
@@ -618,301 +1012,24 @@ namespace dcmqi {
                                                           bool doDicomValueChecks,
                                                           bool outputLabelMap) {
 
-    auto inputSize = segmentations[0]->GetBufferedRegion().GetSize();
+    const typename SegmentationEncoder<ImageSourceType>::Options options =
+        { skipEmptySlices, useLabelIDAsSegmentNumber, referencesGeometryCheck, doDicomValueChecks, outputLabelMap };
+    SegmentationEncoder<ImageSourceType> encoder(dcmDatasets, segmentations, metaInfo, options);
 
-    if(metaInfo.segmentsAttributesMappingList.size() != segmentations.size()){
-      cerr << "Mismatch between the number of input segmentation files and the size of metainfo list!" << endl;
+    std::unique_ptr<DcmDataset> segdocDataset(encoder.encode());
+    if(!segdocDataset)
       return NULL;
-    };
-
-    // Get equipment and content identification information from the metadata handler.
-    // Contains constant dcmqi defaults for equipment and content identification.
-    // These are used to create the DICOM Segmentation object.
-    IODGeneralEquipmentModule::EquipmentInfo eq = getEquipmentInfo();
-    ContentIdentificationMacro ident = createContentIdentificationInformation(metaInfo);
-    CHECK_COND(ident.setInstanceNumber(metaInfo.getInstanceNumber().c_str()));
-
-    // Assigns the Segment Numbers written to DICOM and keeps the mappings
-    // derived from them (label ID per segment number for the re-mapping after
-    // writing, and the labelmap pixel value per input label).
-    // Segment numbers always start at 1; pixel value 0 in labelmap output is
-    // reserved for background per Sup 243, and a background segment with number
-    // 0 (designated via Pixel Padding Value) is added later if needed.
-    SegmentNumberAssigner segmentNumbers(useLabelIDAsSegmentNumber, outputLabelMap, segmentations.size());
-
-    /* Create new segmentation document */
-    bool labelmapUse16Bit = false;
-    if (outputLabelMap && !segmentNumbers.determineLabelmapBitDepth(metaInfo, labelmapUse16Bit))
-      return NULL;
-    std::unique_ptr<DcmSegmentation> segdoc(
-        createSegmentationDocument(inputSize[1], inputSize[0], outputLabelMap,
-                                   labelmapUse16Bit, eq, ident));
-    if (!segdoc)
-      return NULL;
-
-    // import Patient, Study and Frame of Reference; do not import Series
-    // attributes
-    CHECK_COND(segdoc->importHierarchy(*dcmDatasets[0], OFTrue, OFTrue, OFTrue, OFFalse));
-
-    /* Initialize dimension module */
-    initializeDimensions(*segdoc, outputLabelMap);
-
-    /* Initialize shared functional groups */
-    const unsigned frameSize = inputSize[0] * inputSize[1];
-    addGeometrySharedFGs(*segdoc, *segmentations[0]);
-
-    // Inventory of the source images, used to map slices of the segmentation to
-    // the source frames and to create the references derived from that mapping
-    SourceImageIndex sourceIndex(dcmDatasets);
-
-    // Shared FGs: DerivationImageSequence
-    // When geometry checks are disabled, all source images are referenced as
-    // whole instances by all frames.
-    if(!referencesGeometryCheck && dcmDatasets.size() > 1){
-      FGDerivationImage fgderShared;
-      CHECK_COND(sourceIndex.addWholeInstanceDerivationImageItem(fgderShared,
-          segmentationDerivationCode(), "", segmentationDerivationCode()));
-      CHECK_COND(segdoc->addForAllFrames(fgderShared));
-    }
-
-    // Map the slices of each segmentation file to the source frames located on them
-    vector<vector<vector<size_t> > > slice2framesPerFile;
-    bool hasDerivationImagesAny = false;
-    if (referencesGeometryCheck)
-    {
-      slice2framesPerFile.resize(segmentations.size());
-      for (size_t segFileNumber = 0; segFileNumber < segmentations.size(); segFileNumber++)
-      {
-        slice2framesPerFile[segFileNumber] = sourceIndex.mapSlicesToFrames(*segmentations[segFileNumber]);
-        for (vector<vector<size_t> >::const_iterator vI = slice2framesPerFile[segFileNumber].begin(); vI != slice2framesPerFile[segFileNumber].end(); ++vI)
-          if ((*vI).size() > 0)
-            hasDerivationImagesAny = true;
-      }
-    }
-
-    PerFrameFunctionalGroups perFrameFGs;
-    unsigned framesAdded = 0;
-
-    // Iterate over the files and labels available in each file, create a segment for each label,
-    // initialize segment frames and add to the document
-    for(size_t segFileNumber=0; segFileNumber<segmentations.size(); segFileNumber++){
-
-      // note that labels are the same in the input and output image produced
-      // by this filter, see https://itk.org/Doxygen/html/classitk_1_1LabelImageToLabelMapFilter.html
-      using LabelToLabelMapFilterType2 = itk::LabelImageToLabelMapFilter<ImageSourceType>;
-      typename LabelToLabelMapFilterType2::Pointer l2lm = LabelToLabelMapFilterType2::New();
-      l2lm->SetInput(segmentations[segFileNumber]);
-      l2lm->Update();
-
-      typedef typename LabelToLabelMapFilterType2::OutputImageType::LabelObjectType LabelType;
-      typedef itk::LabelStatisticsImageFilter<ImageSourceType,ImageSourceType> LabelStatisticsType;
-
-      typename LabelStatisticsType::Pointer labelStats = LabelStatisticsType::New();
-
-      cout << "Found " << l2lm->GetOutput()->GetNumberOfLabelObjects() << " label(s)" << endl;
-      labelStats->SetInput(segmentations[segFileNumber]);
-      labelStats->SetLabelInput(segmentations[segFileNumber]);
-      labelStats->Update();
-
-      for(unsigned segLabelNumber=0 ; segLabelNumber<l2lm->GetOutput()->GetNumberOfLabelObjects();segLabelNumber++){
-        LabelType* labelObject = l2lm->GetOutput()->GetNthLabelObject(segLabelNumber);
-        short label = labelObject->GetLabel();
-
-        if(!label){
-          continue;
-        }
-
-        cout << "Processing label " << label << endl;
-
-        auto bbox = labelStats->GetBoundingBox(label);
-        unsigned firstSlice, lastSlice;
-        if(skipEmptySlices){
-          firstSlice = bbox[4];
-          lastSlice = bbox[5]+1;
-        } else {
-          firstSlice = 0;
-          lastSlice = inputSize[2];
-        }
-
-        cout << "Total non-empty slices that will be encoded in SEG for label " <<
-        label << " is " << lastSlice-firstSlice+1 << endl <<
-        " (inclusive from " << firstSlice << " to " <<
-        lastSlice << ")" << endl;
-
-        if(metaInfo.segmentsAttributesMappingList[segFileNumber].find(label) == metaInfo.segmentsAttributesMappingList[segFileNumber].end()){
-          cerr << "ERROR: Failed to match label from image to the segment metadata!" << endl;
-          return NULL;
-        }
-
-        DcmSegment* segment = createSegmentFromAttributes(*metaInfo.segmentsAttributesMappingList[segFileNumber][label]);
-        if(!segment)
-          return NULL;
-
-        Uint16 segmentNumber = 0;
-        if (!segmentNumbers.proposeSegmentNumber(label, segmentNumber))
-        {
-          delete segment;
-          return NULL;
-        }
-        CHECK_COND(segdoc->addSegment(segment, segmentNumber /* returns logical segment number */));
-        segmentNumbers.recordSegment(segFileNumber, label, segmentNumber);
-
-        if (outputLabelMap)
-        {
-          continue;
-        }
-
-        // iterate over slices for an individual label and populate output frames
-        for(unsigned sliceNumber=firstSlice;sliceNumber<lastSlice;sliceNumber++){
-
-          perFrameFGs.beginFrame();
-
-          // PerFrame FG: FrameContentSequence
-          CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(segmentNumber, 0));
-          CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(sliceNumber-firstSlice+1, 1));
-
-          // PerFrame FG: PlanePositionSequence
-          setPlanePositionToSlice(perFrameFGs.planePosition(), *segmentations[segFileNumber], sliceNumber);
-
-          // PerFrame FG: DerivationImageSequence, references the source frames
-          // this slice was derived from
-          if(referencesGeometryCheck && !slice2framesPerFile[segFileNumber][sliceNumber].empty()){
-            CHECK_COND(sourceIndex.addDerivationImageItem(perFrameFGs.derivationImage(),
-                slice2framesPerFile[segFileNumber][sliceNumber],
-                segmentationDerivationCode(), "", sourceImagePurposeOfReferenceCode()));
-          }
-
-          /* Add frame that references this segment */
-          vector<Uint8> frameData = extractBinaryFrame(*segmentations[segFileNumber], label, sliceNumber, frameSize);
-          OFCondition frameAdded = segdoc->addFrame(frameData.data(), segmentNumber, perFrameFGs.get());
-          if(frameAdded.good()){
-            framesAdded++;
-          }
-          perFrameFGs.endFrame();
-        }
-      }
-    }
-
-    if (outputLabelMap)
-    {
-      unsigned outputFrameNumber = 1;
-
-      // Stack ID is invariant across all labelmap frames; set it once on the
-      // reused FGFrameContent instance.
-      CHECK_COND(perFrameFGs.frameContent().setStackID("Frame Position"));
-
-      for (unsigned sliceNumber = 0; sliceNumber < inputSize[2]; sliceNumber++)
-      {
-        std::vector<Uint8> frameData8;
-        std::vector<Uint16> frameData16;
-        bool frameHasForeground = false;
-        if (!composeLabelmapFrame(segmentations, segmentNumbers, sliceNumber, frameSize,
-                                  labelmapUse16Bit, frameData8, frameData16, frameHasForeground))
-          return NULL;
-
-        if (skipEmptySlices && !frameHasForeground)
-          continue;
-
-        perFrameFGs.beginFrame();
-
-        CHECK_COND(perFrameFGs.frameContent().setInStackPositionNumber(outputFrameNumber));
-        CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(1, 0));
-        CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(outputFrameNumber, 1));
-
-        setPlanePositionToSlice(perFrameFGs.planePosition(), *segmentations[0], sliceNumber);
-
-        // PerFrame FG: DerivationImageSequence, references the source frames of
-        // this slice across all segmentation files
-        if (referencesGeometryCheck && hasDerivationImagesAny && !slice2framesPerFile.empty())
-        {
-          std::set<size_t> referencedFrameIds;
-          for (size_t segFileNumber = 0; segFileNumber < slice2framesPerFile.size(); segFileNumber++)
-          {
-            if (sliceNumber >= slice2framesPerFile[segFileNumber].size())
-              continue;
-            referencedFrameIds.insert(slice2framesPerFile[segFileNumber][sliceNumber].begin(),
-                                      slice2framesPerFile[segFileNumber][sliceNumber].end());
-          }
-
-          if (!referencedFrameIds.empty())
-          {
-            vector<size_t> frameIds(referencedFrameIds.begin(), referencedFrameIds.end());
-            CHECK_COND(sourceIndex.addDerivationImageItem(perFrameFGs.derivationImage(), frameIds,
-                segmentationDerivationCode(), "", sourceImagePurposeOfReferenceCode()));
-          }
-        }
-
-        OFCondition frameAdded = labelmapUse16Bit
-            ? segdoc->addFrame(frameData16.data(), 0, perFrameFGs.get())
-            : segdoc->addFrame(frameData8.data(), 0, perFrameFGs.get());
-        if (frameAdded.good())
-        {
-          framesAdded++;
-          outputFrameNumber++;
-        }
-        perFrameFGs.endFrame();
-      }
-    }
-
-    // For labelmap output, designate pixel value 0 as background (Background
-    // segment plus Pixel Padding Value) if it occurs in any frame
-    if (outputLabelMap)
-    {
-      CHECK_COND(addBackgroundSegmentIfNeeded(segdoc.get()));
-    }
-
-    if(framesAdded == 0){
-      cerr << "FATAL ERROR: No input labels found - input segmentation is empty!" << endl;
-      cerr << "If you would like to encode background label, please see https://github.com/QIICR/dcmqi/issues/490" << endl;
-      return NULL;
-    }
-
-    // populate the Common Instance Reference module with the references
-    // accumulated while creating the derivation image items
-    CHECK_COND(sourceIndex.populateCommonInstanceReference(segdoc->getCommonInstanceReference()));
-
-    segdoc->getSeries().setSeriesNumber(metaInfo.getSeriesNumber().c_str());
-
-    OFString frameOfRefUID;
-    if(!segdoc->getFrameOfReference().getFrameOfReferenceUID(frameOfRefUID).good()){
-      // TODO: add FoR UID to the metadata JSON and check that before generating one!
-      char frameOfRefUIDchar[128];
-      dcmGenerateUniqueIdentifier(frameOfRefUIDchar, QIICR_UID_ROOT);
-      CHECK_COND(segdoc->getFrameOfReference().setFrameOfReferenceUID(frameOfRefUIDchar));
-    }
-
-    std::cout << "Writing DICOM segmentation dataset" << std::endl;
-    // Don't check functional groups since its very time consuming and we trust
-    // ourselves to put together valid datasets
-    segdoc->setCheckFGOnWrite(OFFalse);
-
-    // Ensure dataset memory is cleaned up on exit, and avoid the copy on
-    // return that was performed before
-    std::unique_ptr<DcmDataset> segdocDataset(new DcmDataset());
-    std::cout << "Checking DICOM attribute values before writing: " << (doDicomValueChecks ? "enabled" : "disabled") << std::endl;
-    segdoc->setValueCheckOnWrite(doDicomValueChecks);
-    OFCondition writeResult = segdoc->writeDataset(*segdocDataset);
-    if(writeResult.bad()){
-      cerr << "FATAL ERROR: Writing of the SEG dataset failed!";
-      if (writeResult.text()){
-        cerr << " Error: " << writeResult.text() << ".";
-      }
-      cerr << " Please report the problem to the developers, ideally accompanied by a de-identified dataset allowing to reproduce the problem!" << endl;
-      return NULL;
-    }
-
-    patchDerivedAttributes(*segdocDataset, *segdoc, metaInfo, *dcmDatasets[0], outputLabelMap, segmentations.size());
 
     if (useLabelIDAsSegmentNumber && !outputLabelMap)
     {
       // Binary segmentations require Segment Numbers to start at 1 and increase
       // monotonically by 1, so re-mapping to label IDs only works for label IDs
       // that satisfy the same constraint.
-      if (!checkLabelNumbering(segmentNumbers.segmentToLabel()))
+      if (!checkLabelNumbering(encoder.segmentToLabel()))
       {
         return NULL;
       }
-      mapLabelIDsToSegmentNumbers(segdocDataset.get(), segmentNumbers.segmentToLabel());
+      mapLabelIDsToSegmentNumbers(segdocDataset.get(), encoder.segmentToLabel());
     }
     // For labelmap output the label IDs were used as segment numbers directly when
     // the segments were added. LABELMAP only requires segment numbers to be unique
@@ -921,7 +1038,6 @@ namespace dcmqi {
 
     return segdocDataset.release();
   }
-
 
   bool Itk2DicomConverter::mapLabelIDsToSegmentNumbers(DcmDataset* dset, map<Uint16,Uint16> segNum2Label)
   {

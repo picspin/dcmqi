@@ -55,9 +55,8 @@ namespace dcmqi {
      *        numbered monotonically without gaps; if n labels are not assigned uniquely to
      *        label IDs 1..n in the input, the conversion will fail. For labelmap output
      *        (outputLabelMap=true) any set of unique positive label IDs is allowed, including
-     *        gaps, since LABELMAP does not require consecutive segment numbers
-     *        (https://github.com/QIICR/dcmqi/issues/537); label IDs that are used by more
-     *        than one input segment make the conversion fail.
+     *        gaps, since LABELMAP does not require consecutive segment numbers;
+     *        label IDs that are used by more than one input segment make the conversion fail.
      *        The processing order of label IDs is not relevant, i.e. they can occur in any order in the input.
      *        If this is set to false (default), the segment numbers are assigned in the order of the
      *        labels that are being converted, i.e. the first label will receive the Segment
@@ -68,7 +67,9 @@ namespace dcmqi {
      *        are updated by this flag, compared to the default behavior (false). Of course, the
      *        resulting DICOM object is still valid, dimensions are consistent and lead to meaningful
      *        display.
-     * @param referencesGeometryCheck A boolean indicating whether the conversion process should attempt checking if the geometry of the referenced DICOM images is consistent with the corresponding slices of the segmentation.
+     * @param referencesGeometryCheck A boolean indicating whether the conversion process should attempt
+     *        checking if the geometry of the referenced DICOM images is consistent with the corresponding
+     *        slices of the segmentation.
      *        By default, this check is enabled. If disabled, all of the references will be
      *        added in the SharedFunctionalGroupsSequence without any geometry checks.
      * @param doDicomValueChecks A boolean indicating whether to check the values of DICOM attributes
@@ -78,7 +79,7 @@ namespace dcmqi {
      *       (e.g., VR of Patients'Name is violated, wrong value multiplicity, etc.).
      *       However, the resulting DICOM object may not be compliant with the DICOM standard in this case.
      * @param outputLabelMap If true, create a DICOM Labelmap Segmentation object
-     *       (SOP Class UID 1.2.840.10008.5.1.4.1.1.66.7, per Sup 243) directly
+     *       (SOP Class UID 1.2.840.10008.5.1.4.1.1.66.7) directly
      *       instead of a binary DICOM Segmentation object. Behavioral
      *       differences when set to true:
      *       - Output uses MONOCHROME2 photometric interpretation. Bit depth is
