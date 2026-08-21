@@ -230,6 +230,74 @@ namespace dcmqi {
       return segment;
     }
 
+    /** Owns the functional groups that are re-filled for every frame of the
+     *  output, and enforces the protocol they have to be used with:
+     *  beginFrame() before filling them, get() when handing them to
+     *  DcmSegmentation::addFrame(), endFrame() afterwards.
+     *
+     *  Plane Position (Patient) and Frame Content apply to every frame, while
+     *  the Derivation Image group is only part of a frame that actually
+     *  references source images (an empty Derivation Image Sequence would be
+     *  invalid). Its content is per-frame state that must be cleared once the
+     *  frame has been added, otherwise the next frame inherits the references
+     *  of its predecessor - endFrame() takes care of that.
+     */
+    class PerFrameFunctionalGroups {
+
+    public:
+
+      PerFrameFunctionalGroups()
+        : m_planePosition(FGPlanePosPatient::createMinimal("1","1","1")),
+          m_frameContent(new FGFrameContent()),
+          m_derivationImage(new FGDerivationImage()),
+          m_derivationImageUsed(false)
+      {
+      }
+
+      /** Start a new frame: drop what the previous frame collected */
+      void beginFrame() {
+        m_functionalGroups.clear();
+        m_functionalGroups.push_back(m_planePosition.get());
+        m_functionalGroups.push_back(m_frameContent.get());
+        m_derivationImageUsed = false;
+      }
+
+      FGPlanePosPatient& planePosition() { return *m_planePosition; }
+
+      FGFrameContent& frameContent() { return *m_frameContent; }
+
+      /** Access the Derivation Image group and add it to this frame. Adding it
+       *  more than once per frame is a no-op, so several source image items can
+       *  be collected into the same group. */
+      FGDerivationImage& derivationImage() {
+        if(!m_derivationImageUsed){
+          m_functionalGroups.push_back(m_derivationImage.get());
+          m_derivationImageUsed = true;
+        }
+        return *m_derivationImage;
+      }
+
+      /** The groups of the current frame, for DcmSegmentation::addFrame() */
+      const OFVector<FGBase*>& get() const { return m_functionalGroups; }
+
+      /** Finish the frame: release the per-frame content of the Derivation
+       *  Image group so it does not leak into the next frame */
+      void endFrame() {
+        if(m_derivationImageUsed){
+          m_derivationImage->clearData();
+          m_derivationImageUsed = false;
+        }
+      }
+
+    private:
+
+      std::unique_ptr<FGPlanePosPatient> m_planePosition;
+      std::unique_ptr<FGFrameContent> m_frameContent;
+      std::unique_ptr<FGDerivationImage> m_derivationImage;
+      OFVector<FGBase*> m_functionalGroups;
+      bool m_derivationImageUsed;
+    };
+
     /** Set the Image Position (Patient) of the given plane position FG to the
      *  origin of the given slice of the image */
     void setPlanePositionToSlice(FGPlanePosPatient& fgppp, const itk::ImageBase<3>& image, const unsigned sliceNumber) {
@@ -461,6 +529,9 @@ namespace dcmqi {
       return NULL;
     };
 
+    // Get equipment and content identification information from the metadata handler.
+    // Contains constant dcmqi defaults for equipment and content identification.
+    // These are used to create the DICOM Segmentation object.
     IODGeneralEquipmentModule::EquipmentInfo eq = getEquipmentInfo();
     ContentIdentificationMacro ident = createContentIdentificationInformation(metaInfo);
     CHECK_COND(ident.setInstanceNumber(metaInfo.getInstanceNumber().c_str()));
@@ -529,10 +600,7 @@ namespace dcmqi {
       }
     }
 
-    std::unique_ptr<FGPlanePosPatient> fgppp(FGPlanePosPatient::createMinimal("1","1","1"));
-    std::unique_ptr<FGFrameContent> fgfc(new FGFrameContent());
-    std::unique_ptr<FGDerivationImage> fgder(new FGDerivationImage());
-    OFVector<FGBase*> perFrameFGs;
+    PerFrameFunctionalGroups perFrameFGs;
     unsigned framesAdded = 0;
 
     // Iterate over the files and labels available in each file, create a segment for each label,
@@ -627,39 +695,30 @@ namespace dcmqi {
         // iterate over slices for an individual label and populate output frames
         for(unsigned sliceNumber=firstSlice;sliceNumber<lastSlice;sliceNumber++){
 
+          perFrameFGs.beginFrame();
+
           // PerFrame FG: FrameContentSequence
-          CHECK_COND(fgfc->setDimensionIndexValues(segmentNumber, 0));
-          CHECK_COND(fgfc->setDimensionIndexValues(sliceNumber-firstSlice+1, 1));
+          CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(segmentNumber, 0));
+          CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(sliceNumber-firstSlice+1, 1));
 
           // PerFrame FG: PlanePositionSequence
-          setPlanePositionToSlice(*fgppp, *segmentations[segFileNumber], sliceNumber);
-
-          /* Add frame that references this segment */
-          vector<Uint8> frameData = extractBinaryFrame(*segmentations[segFileNumber], label, sliceNumber, frameSize);
-
-          perFrameFGs.clear();
-          perFrameFGs.push_back(fgppp.get());
-          perFrameFGs.push_back(fgfc.get());
+          setPlanePositionToSlice(perFrameFGs.planePosition(), *segmentations[segFileNumber], sliceNumber);
 
           // PerFrame FG: DerivationImageSequence, references the source frames
           // this slice was derived from
-          bool frameHasReferences = false;
           if(referencesGeometryCheck && !slice2framesPerFile[segFileNumber][sliceNumber].empty()){
-            CHECK_COND(sourceIndex.addDerivationImageItem(*fgder, slice2framesPerFile[segFileNumber][sliceNumber],
+            CHECK_COND(sourceIndex.addDerivationImageItem(perFrameFGs.derivationImage(),
+                slice2framesPerFile[segFileNumber][sliceNumber],
                 segmentationDerivationCode(), "", sourceImagePurposeOfReferenceCode()));
-            perFrameFGs.push_back(fgder.get());
-            frameHasReferences = true;
           }
 
-          OFCondition frameAdded = segdoc->addFrame(frameData.data(), segmentNumber, perFrameFGs);
+          /* Add frame that references this segment */
+          vector<Uint8> frameData = extractBinaryFrame(*segmentations[segFileNumber], label, sliceNumber, frameSize);
+          OFCondition frameAdded = segdoc->addFrame(frameData.data(), segmentNumber, perFrameFGs.get());
           if(frameAdded.good()){
             framesAdded++;
           }
-
-          // clean up the derivation image FG for the next frame, only if applicable!
-          if(frameHasReferences){
-            fgder->clearData();
-          }
+          perFrameFGs.endFrame();
         }
       }
     }
@@ -670,7 +729,7 @@ namespace dcmqi {
 
       // Stack ID is invariant across all labelmap frames; set it once on the
       // reused FGFrameContent instance.
-      CHECK_COND(fgfc->setStackID("Frame Position"));
+      CHECK_COND(perFrameFGs.frameContent().setStackID("Frame Position"));
 
       for (unsigned sliceNumber = 0; sliceNumber < inputSize[2]; sliceNumber++)
       {
@@ -684,19 +743,16 @@ namespace dcmqi {
         if (skipEmptySlices && !frameHasForeground)
           continue;
 
-        CHECK_COND(fgfc->setInStackPositionNumber(outputFrameNumber));
-        CHECK_COND(fgfc->setDimensionIndexValues(1, 0));
-        CHECK_COND(fgfc->setDimensionIndexValues(outputFrameNumber, 1));
+        perFrameFGs.beginFrame();
 
-        setPlanePositionToSlice(*fgppp, *segmentations[0], sliceNumber);
+        CHECK_COND(perFrameFGs.frameContent().setInStackPositionNumber(outputFrameNumber));
+        CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(1, 0));
+        CHECK_COND(perFrameFGs.frameContent().setDimensionIndexValues(outputFrameNumber, 1));
 
-        perFrameFGs.clear();
-        perFrameFGs.push_back(fgppp.get());
-        perFrameFGs.push_back(fgfc.get());
+        setPlanePositionToSlice(perFrameFGs.planePosition(), *segmentations[0], sliceNumber);
 
         // PerFrame FG: DerivationImageSequence, references the source frames of
         // this slice across all segmentation files
-        bool frameHasReferences = false;
         if (referencesGeometryCheck && hasDerivationImagesAny && !slice2framesPerFile.empty())
         {
           std::set<size_t> referencedFrameIds;
@@ -711,26 +767,20 @@ namespace dcmqi {
           if (!referencedFrameIds.empty())
           {
             vector<size_t> frameIds(referencedFrameIds.begin(), referencedFrameIds.end());
-            CHECK_COND(sourceIndex.addDerivationImageItem(*fgder, frameIds,
+            CHECK_COND(sourceIndex.addDerivationImageItem(perFrameFGs.derivationImage(), frameIds,
                 segmentationDerivationCode(), "", sourceImagePurposeOfReferenceCode()));
-            perFrameFGs.push_back(fgder.get());
-            frameHasReferences = true;
           }
         }
 
         OFCondition frameAdded = labelmapUse16Bit
-            ? segdoc->addFrame(frameData16.data(), 0, perFrameFGs)
-            : segdoc->addFrame(frameData8.data(), 0, perFrameFGs);
+            ? segdoc->addFrame(frameData16.data(), 0, perFrameFGs.get())
+            : segdoc->addFrame(frameData8.data(), 0, perFrameFGs.get());
         if (frameAdded.good())
         {
           framesAdded++;
           outputFrameNumber++;
         }
-
-        if (frameHasReferences)
-        {
-          fgder->clearData();
-        }
+        perFrameFGs.endFrame();
       }
     }
 
