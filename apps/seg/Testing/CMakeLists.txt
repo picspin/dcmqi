@@ -45,6 +45,33 @@ dcmqi_add_test(
     ${DICOM_DIR}/03.dcm
   )
 
+#-----------------------------------------------------------------------------
+# Regression test for the Common Instance Reference module
+# (https://github.com/QIICR/dcmqi/issues/554): when several source instances
+# map to the same segmentation frame, all of them must appear in the top-level
+# Referenced Instance Sequence, and instances must be grouped by the series
+# they actually belong to. The additional source instances (a same-plane
+# duplicate and one from a second series) are derived in memory from the
+# classic series, so no fixture files are needed.
+add_executable(CommonInstanceReferenceTest
+  CommonInstanceReferenceTest.cxx)
+target_link_libraries(CommonInstanceReferenceTest
+  dcmqi
+  ${DCMTK_LIBRARIES})
+set_target_properties(CommonInstanceReferenceTest PROPERTIES
+  LABELS ${MODULE_NAME})
+
+dcmqi_add_test(
+  NAME ${itk2dcm}_commonInstanceReference
+  MODULE_NAME ${MODULE_NAME}
+  COMMAND $<TARGET_FILE:CommonInstanceReferenceTest>
+    ${CMAKE_SOURCE_DIR}/doc/examples/seg-example.json
+    ${BASELINE}/liver_seg.nrrd
+    ${DICOM_DIR}/01.dcm
+    ${DICOM_DIR}/02.dcm
+    ${DICOM_DIR}/03.dcm
+  )
+
 dcmqi_add_test(
   NAME ${itk2dcm}_makeSEG
   MODULE_NAME ${MODULE_NAME}
