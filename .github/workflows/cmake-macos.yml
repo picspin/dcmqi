@@ -54,6 +54,11 @@ jobs:
         wget --no-check-certificate https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-mac.zip
         unzip ninja-mac.zip && sudo cp ninja /usr/local/bin/
 
+    # Provides dciodvfy, which apps/*/Testing/CMakeLists.txt look up with find_program().
+    # Without it CMake silently drops the DICOM conformance tests.
+    - name: "Install dicom3tools"
+      uses: ./.github/actions/install-dicom3tools
+
     # Make sure all directories required for computing the hash actually exist
     - name: "Prepare cache directories"
       run: |
@@ -141,6 +146,16 @@ jobs:
     - name: "Build dcmqi"
       run: |
         cd ${{ github.workspace }}/dcmqi-build && ninja
+
+    # Guard against the silent-skip failure mode: when find_program() fails to locate
+    # dciodvfy, CMake drops the conformance tests without failing anything, so the checks
+    # stop running unnoticed. Assert they were registered before running the suite.
+    - name: "Verify dciodvfy tests are registered"
+      run: |
+        cd ${{ github.workspace }}/dcmqi-build/dcmqi-build
+        count=$(ctest -N -R dciodvfy | sed -n 's/^Total Tests: //p')
+        echo "dciodvfy tests registered: ${count:-0}"
+        [ "${count:-0}" -gt 0 ]
 
     - name: "Test dcmqi"
       run: |

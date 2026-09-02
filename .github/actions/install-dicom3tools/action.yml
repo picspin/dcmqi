@@ -1,0 +1,89 @@
+name: "Install dicom3tools"
+description: >
+  Download a prebuilt dicom3tools distribution and prepend it to PATH, so that the
+  find_program(DCIODVFY_EXECUTABLE dciodvfy) calls in apps/*/Testing/CMakeLists.txt
+  succeed and the optional dciodvfy conformance tests are actually registered.
+
+# To move to a newer dicom3tools build, bump RELEASE_TAG and replace all three
+# digests below with the ones published for that release. The digests are verified
+# unconditionally: a release asset can be replaced in place under an unchanged tag,
+# so pinning the tag alone would not pin the bytes CI executes.
+
+runs:
+  using: composite
+  steps:
+    - name: "Install dicom3tools (dciodvfy)"
+      shell: bash
+      env:
+        RELEASE_REPO: fedorov/dicom3tools
+        RELEASE_TAG: dicom3tools.20260901072548.post1
+        SHA256_LINUX: d793a53a0f6cc4bae28b2979f67b583783d0954a7da7a2cd40b7359adbf681ae
+        SHA256_MACOS: a5d1f718a2d47f5dc5566ec34762bf55641b2f8c8c5c7d922404f5a6a9fe3afe
+        SHA256_WINDOWS: 9bb25b5ee3692cd2690c8f62007f2c352f5870c81c5c2ca3abf08042d44781da
+      run: |
+        set -euo pipefail
+
+        case "$RUNNER_OS" in
+          Linux)   asset=dicom3tools-linux-x86_64.tar.gz;     expected=$SHA256_LINUX ;;
+          macOS)   asset=dicom3tools-macos-universal.tar.gz;  expected=$SHA256_MACOS ;;
+          Windows) asset=dicom3tools-windows-x86_64.zip;      expected=$SHA256_WINDOWS ;;
+          *) echo "Unsupported runner OS: $RUNNER_OS" >&2; exit 1 ;;
+        esac
+
+        archive="$RUNNER_TEMP/$asset"
+        dest="$RUNNER_TEMP/dicom3tools"
+        mkdir -p "$dest"
+
+        url="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG/$asset"
+        echo "Downloading $url"
+        curl -fsSL --retry 3 --retry-delay 5 -o "$archive" "$url"
+
+        actual=$(openssl dgst -sha256 -r "$archive" | cut -d' ' -f1)
+        if [ "$actual" != "$expected" ]; then
+          echo "Checksum mismatch for $asset" >&2
+          echo "  expected: $expected" >&2
+          echo "  actual:   $actual" >&2
+          exit 1
+        fi
+
+        # All three archives are flat: every tool sits at the archive root, and the
+        # Windows build ships its Cygwin DLLs next to the executables, which is where
+        # Windows looks for them first.
+        case "$asset" in
+          *.tar.gz)
+            tar xzf "$archive" -C "$dest"
+            ;;
+          *.zip)
+            # unzip is not present on the hosted Windows images; 7z is.
+            if command -v 7z >/dev/null 2>&1; then
+              7z x -bso0 -o"$dest" "$archive"
+            else
+              unzip -q "$archive" -d "$dest"
+            fi
+            ;;
+        esac
+
+        exe="$dest/dciodvfy"
+        [ -f "$exe" ] || exe="$dest/dciodvfy.exe"
+        if [ ! -f "$exe" ]; then
+          echo "dciodvfy not found in $asset" >&2
+          ls -la "$dest" >&2
+          exit 1
+        fi
+        chmod +x "$exe"
+
+        # Smoke test. With no file argument dciodvfy validates (empty) stdin, which is
+        # enough to exercise dynamic loading. Exit codes >= 126 mean the binary could not
+        # be executed at all (missing loader, too-old glibc); anything lower is dciodvfy
+        # reporting on its input, which is not an error here. Failing loudly beats letting
+        # CMake quietly drop the tests again.
+        rc=0
+        "$exe" < /dev/null > "$RUNNER_TEMP/dciodvfy-smoke.log" 2>&1 || rc=$?
+        if [ "$rc" -ge 126 ]; then
+          echo "dciodvfy cannot be executed on this runner (exit $rc):" >&2
+          cat "$RUNNER_TEMP/dciodvfy-smoke.log" >&2
+          exit 1
+        fi
+
+        echo "$dest" >> "$GITHUB_PATH"
+        echo "dciodvfy installed at $exe"

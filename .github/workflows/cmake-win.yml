@@ -42,6 +42,11 @@ jobs:
         run: |
           pip install jsondiff
 
+      # Provides dciodvfy, which apps/*/Testing/CMakeLists.txt look up with find_program().
+      # Without it CMake silently drops the DICOM conformance tests.
+      - name: Install dicom3tools
+        uses: ./.github/actions/install-dicom3tools
+
       - name: Cache build dependencies
         id: cache-build-deps
         uses: actions/cache/restore@v6
@@ -79,6 +84,17 @@ jobs:
         run: |
           cd ${{ github.workspace }}\b/
           cmake --build . --config Release -- /m
+
+      # Guard against the silent-skip failure mode: when find_program() fails to locate
+      # dciodvfy, CMake drops the conformance tests without failing anything, so the checks
+      # stop running unnoticed. Assert they were registered before running the suite.
+      - name: Verify dciodvfy tests are registered
+        shell: bash
+        run: |
+          cd "${{ github.workspace }}/b/dcmqi-build"
+          count=$(ctest -N -C Release -R dciodvfy | sed -n 's/^Total Tests: //p')
+          echo "dciodvfy tests registered: ${count:-0}"
+          [ "${count:-0}" -gt 0 ]
 
       - name: Test dcmqi
         run: |
