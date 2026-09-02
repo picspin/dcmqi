@@ -84,8 +84,11 @@ namespace dcmqi {
     char dimUID[128];
     dcmGenerateUniqueIdentifier(dimUID, QIICR_UID_ROOT);
     IODMultiframeDimensionModule &mfdim = pMapDoc->getIODMultiframeDimensionModule();
+    // The functional group pointer must name the sequence that actually contains the
+    // attribute the dimension index points at. ImagePositionPatient lives in
+    // PlanePositionSequence (written per-frame below), not RealWorldValueMappingSequence.
     OFCondition result = mfdim.addDimensionIndex(DCM_ImagePositionPatient, dimUID,
-                                                 DCM_RealWorldValueMappingSequence, "Frame position");
+                                                 DCM_PlanePositionSequence, "Frame position");
 
     // Shared FGs: PixelMeasuresSequence
     {
