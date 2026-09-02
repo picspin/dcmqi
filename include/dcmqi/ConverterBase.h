@@ -344,42 +344,6 @@ namespace dcmqi {
       return 0;
     }
 
-    // AF: I could not quickly figure out how to template this function over image type - suggestions are welcomed!
-    template<class ImageSourceType>
-    static vector<vector<int> > getSliceMapForSegmentation2DerivationImage(const vector<DcmItem*> dcmDatasets,
-                                                                                       const ImageSourceType& labelImage) {
-      // Find mapping from the segmentation slice number to the derivation image
-      // Assume that orientation of the segmentation is the same as the source series
-      unsigned numLabelSlices = labelImage->GetLargestPossibleRegion().GetSize()[2];
-      vector<vector<int> > slice2derimg(numLabelSlices);
-      vector<bool> slice2derimgPresent(numLabelSlices, false);
-
-      int slicesMapped = 0;
-      for(size_t i=0;i<dcmDatasets.size();i++){
-        OFString ippStr;
-        ShortImageType::PointType ippPoint;
-        ShortImageType::IndexType ippIndex;
-        for(int j=0;j<3;j++){
-          CHECK_COND(dcmDatasets[i]->findAndGetOFString(DCM_ImagePositionPatient, ippStr, j));
-          ippPoint[j] = atof(ippStr.c_str());
-        }
-        if(!labelImage->TransformPhysicalPointToIndex(ippPoint, ippIndex)){
-          // if certain DICOM instance does not map to a label slice, just skip it
-          continue;
-        }
-        OFString sopInstanceUID;
-        CHECK_COND(dcmDatasets[i]->findAndGetOFString(DCM_SOPInstanceUID, sopInstanceUID));
-        // TODO: show the below when verbose mode is selected!
-        // cout << "SOPInstanceUID " << sopInstanceUID << " mapped" << endl;
-        slice2derimg[ippIndex[2]].push_back(i);
-        if(slice2derimgPresent[ippIndex[2]] == false)
-          slicesMapped++;
-        slice2derimgPresent[ippIndex[2]] = true;
-      }
-      cout << slicesMapped << " of " << slice2derimgPresent.size() << " slices mapped to source DICOM images" << endl;
-      return slice2derimg;
-    }
-
   };
 
 }

@@ -23,6 +23,7 @@ set(HDRS
   ${INCLUDE_DIR}/JSONParametricMapMetaInformationHandler.h
   ${INCLUDE_DIR}/JSONSegmentationMetaInformationHandler.h
   ${INCLUDE_DIR}/SegmentAttributes.h
+  ${INCLUDE_DIR}/SourceImageIndex.h
   ${INCLUDE_DIR}/TID1500Reader.h
   )
 
@@ -40,6 +41,7 @@ set(SRCS
   JSONParametricMapMetaInformationHandler.cpp
   JSONSegmentationMetaInformationHandler.cpp
   SegmentAttributes.cpp
+  SourceImageIndex.cpp
   TID1500Reader.cpp
   )
 
